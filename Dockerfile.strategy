@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY spot_contest/participant_runner.py /runner.py
+WORKDIR /submission
+USER 65534:65534
+ENTRYPOINT ["python", "-I", "-u", "/runner.py", "/submission"]

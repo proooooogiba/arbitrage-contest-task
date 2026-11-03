@@ -1,0 +1,44 @@
+{
+  "symbol": "SOLUSDT",
+  "base_asset": "SOL",
+  "quote_asset": "USDT",
+  "reference_price": "100",
+  "venues": {
+    "binance": {
+      "taker_fee_bps": "10",
+      "order_latency_ns": 5000000,
+      "report_latency_ns": 3000000,
+      "extra_feed_latency_ns": 0,
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_notional": "5",
+      "initial_base": "250",
+      "initial_quote": "25000"
+    },
+    "bybit": {
+      "taker_fee_bps": "10",
+      "order_latency_ns": 8000000,
+      "report_latency_ns": 4000000,
+      "extra_feed_latency_ns": 0,
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_notional": "5",
+      "initial_base": "250",
+      "initial_quote": "25000"
+    }
+  },
+  "compute_latency_ns": 1000000,
+  "max_book_age_ns": 500000000,
+  "depth_fraction": "0.05",
+  "max_order_notional": "1000",
+  "turnover_window_ns": 1000000000,
+  "max_window_turnover": "5000",
+  "max_net_exposure": "2000",
+  "max_orders_per_callback": 8,
+  "max_orders": 100000,
+  "callback_timeout_s": 5,
+  "max_message_bytes": 1048576,
+  "sandbox_memory_mb": 1024,
+  "sandbox_cpus": "1",
+  "max_run_seconds": 1800
+}
