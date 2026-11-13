@@ -83,6 +83,8 @@ class Config(Contract):
     turnover_window_ns: PositiveInteger = 1_000_000_000
     max_window_turnover: PositiveMoney = Decimal("5000")
     max_net_exposure: PositiveMoney = Decimal("2000")
+    require_paired_orders: Annotated[bool, Field(strict=True)] = False
+    max_unhedged_duration_ns: PositiveInteger = 2_000_000_000
     max_orders_per_callback: PositiveInteger = 8
     max_orders: PositiveInteger = 100000
     callback_timeout_s: PositiveInteger = 5
@@ -97,6 +99,12 @@ class Config(Contract):
             raise ValueError("base and quote assets must differ")
         if self.initial_equity <= 0:
             raise ValueError("starting equity must be positive")
+        if self.require_paired_orders:
+            if self.max_orders_per_callback < 2:
+                raise ValueError("paired mode requires at least two orders per callback")
+            lots = [venue.lot_size for venue in self.venues.values()]
+            if max(lots) % min(lots):
+                raise ValueError("paired mode requires commensurate venue lots")
         return self
 
     @classmethod
@@ -130,6 +138,8 @@ class Config(Contract):
             "turnover_window_ns": self.turnover_window_ns,
             "max_window_turnover": self.max_window_turnover,
             "max_net_exposure": self.max_net_exposure,
+            "require_paired_orders": self.require_paired_orders,
+            "max_unhedged_duration_ns": self.max_unhedged_duration_ns,
             "venues": {
                 name: {
                     "taker_fee_bps": v.taker_fee_bps,

@@ -100,6 +100,13 @@ class Judge:
         self.config, self.strategy = config, strategy
         self.audit = audit or (lambda row: None)
         self.books = {name: Book(config.depth_fraction) for name in config.venues}
+        self.visible_books = (
+            {name: Book(config.depth_fraction) for name in config.venues}
+            if config.require_paired_orders
+            else {}
+        )
+        self.pending_orders = set()
+        self.hedge_deadline = None
         self.accounts = {
             name: {
                 "base": v.initial_base,
@@ -192,6 +199,11 @@ class Judge:
                 self.mark()
             elif kind == "arrival":
                 self.execute(payload)
+            elif kind == "hedge_deadline":
+                if self.end is not None and self.now > self.end:
+                    continue
+                if self.hedge_deadline == payload and self.exposure() != ZERO:
+                    raise ValueError("UNHEDGED_EXPOSURE_TIMEOUT")
             elif kind == "deliver":
                 if payload["type"] == "execution":
                     base_delta = payload.pop("base_delta", ZERO)
@@ -207,6 +219,15 @@ class Judge:
                 if self.now < self.busy_until:
                     self.push(self.busy_until, 3, "callback", payload)
                     continue
+                if payload.pop("_settle_pending", False):
+                    self.pending_orders.discard(payload["id"])
+                if (
+                    self.config.require_paired_orders
+                    and payload["type"] == "market"
+                    and payload["event"]["event_type"] == "book"
+                ):
+                    event = payload["event"]
+                    self.visible_books[event["exchange"]].apply(event)
                 request = dict(
                     payload,
                     now_ns=self.now,
@@ -220,8 +241,7 @@ class Judge:
                 ):
                     raise ValueError("strategy must return a bounded orders list")
                 self.busy_until = self.now + self.config.compute_latency_ns
-                for order in orders:
-                    self.submit(order, self.busy_until)
+                self.submit_orders(orders, self.busy_until)
         result = self.score()
         result.update(
             events=event_count,
@@ -241,6 +261,7 @@ class Judge:
         notional: Decimal = ZERO,
         fee: Decimal = ZERO,
         t: Optional[int] = None,
+        settle_pending: bool = False,
     ) -> None:
         exchange = order.get("exchange", "")
         if not isinstance(exchange, str):
@@ -261,62 +282,161 @@ class Judge:
             "base_delta": base_delta,
             "quote_delta": quote_delta,
         }
+        if self.config.require_paired_orders and settle_pending:
+            report["_settle_pending"] = True
         self.log("execution", report=dict(report))
         latency = self.config.venues[exchange].report_latency_ns if exchange in self.books else 0
         self.push((self.now if t is None else t) + latency, 2, "deliver", report)
         if status == "Rejected":
             self.rejected += 1
 
-    def submit(self, raw: Any, ready: int) -> None:
-        self.order_count += 1
+    def _count_orders(self, count: int) -> None:
+        self.order_count += count
         if self.order_count > self.config.max_orders:
             raise ValueError("submission exceeds total order budget")
+
+    def _validate_order(self, raw: Any, ready: int) -> Dict[str, Any]:
+        order = OrderRequest.model_validate(raw).model_dump()
+        if order["id"] in self.ids:
+            raise ValueError("INVALID_OR_DUPLICATE_ID")
+        self.ids.add(order["id"])
+        if order["exchange"] not in self.books or order["symbol"] != self.config.symbol:
+            raise ValueError("UNKNOWN_INSTRUMENT")
+        venue = self.config.venues[order["exchange"]]
+        qty, price = order["qty"], order["price"]
+        if qty <= 0 or price <= 0 or qty % venue.lot_size or price % venue.tick_size:
+            raise ValueError("INVALID_TICK_OR_LOT")
+        notional = price * qty
+        if not venue.min_notional <= notional <= self.config.max_order_notional:
+            raise ValueError("ORDER_NOTIONAL_LIMIT")
+        window = self.turnover[order["exchange"]]
+        while window and window[0][0] <= ready - self.config.turnover_window_ns:
+            window.popleft()
+        if sum((n for _, n in window), ZERO) + notional > self.config.max_window_turnover:
+            raise ValueError("WINDOW_NOTIONAL_LIMIT")
+        wallet = self.accounts[order["exchange"]]
+        reserve = notional * (1 + venue.taker_fee_bps / BPS) if order["side"] == "Buy" else qty
+        asset = "quote" if order["side"] == "Buy" else "base"
+        if wallet[asset] - wallet["reserved_" + asset] < reserve:
+            raise ValueError("INSUFFICIENT_BALANCE")
+        order.update(_reserve=reserve, _asset=asset)
+        return order
+
+    def _accept_order(self, order: Dict[str, Any], ready: int) -> None:
+        name = order["exchange"]
+        self.accounts[name]["reserved_" + order["_asset"]] += order["_reserve"]
+        self.turnover[name].append((ready, order["price"] * order["qty"]))
+        if self.config.require_paired_orders:
+            self.pending_orders.add(order["id"])
+        arrival = ready + self.config.venues[name].order_latency_ns
+        self.push(arrival, 1, "arrival", order)
+        self.log(
+            "accepted",
+            order={k: v for k, v in order.items() if not k.startswith("_")},
+            arrival_ns=arrival,
+        )
+
+    def _reject_orders(self, orders: List[Any], reason: str, ready: int) -> None:
+        for raw in orders:
+            self.report(raw if isinstance(raw, dict) else {}, "Rejected", reason, t=ready)
+
+    def _require_marketable(self, order: Dict[str, Any], ready: int, full_depth: bool) -> None:
+        book = self.visible_books[order["exchange"]]
+        if not book.fresh(ready, self.config.max_book_age_ns):
+            raise ValueError("OBSERVED_BOOK_UNAVAILABLE")
+        buy = order["side"] == "Buy"
+        side = "asks" if buy else "bids"
+        prices = book.prices(side)
+        best = prices[0]
+        if buy and order["price"] < best or not buy and order["price"] > best:
+            raise ValueError("NON_MARKETABLE_LIMIT")
+        if full_depth:
+            lot = self.config.venues[order["exchange"]].lot_size
+            available = ZERO
+            for price in prices:
+                if buy and price > order["price"] or not buy and price < order["price"]:
+                    break
+                available += floor_lot(book.levels[side][price] * book.fraction, lot)
+            if available < order["qty"]:
+                raise ValueError("INSUFFICIENT_OBSERVED_DEPTH")
+
+    def submit_orders(self, orders: List[Any], ready: int) -> None:
+        if not self.config.require_paired_orders:
+            for raw in orders:
+                self.submit(raw, ready)
+            return
+        self._count_orders(len(orders))
+        if not orders:
+            return
+        if self.pending_orders:
+            self._reject_orders(orders, "AWAITING_EXECUTION_REPORTS", ready)
+            return
+        exposure = self.exposure()
+        if exposure != ZERO:
+            if len(orders) != 1:
+                self._reject_orders(orders, "RESIDUAL_HEDGE_REQUIRED", ready)
+                return
+            try:
+                hedge = self._validate_order(orders[0], ready)
+                if (hedge["side"] == "Buy") != (exposure < ZERO):
+                    raise ValueError("HEDGE_MUST_REDUCE_EXPOSURE")
+                self._require_marketable(hedge, ready, full_depth=False)
+                hedge["_hedge"] = True
+                self._accept_order(hedge, ready)
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                self._reject_orders(orders, str(exc), ready)
+            return
+        if len(orders) % 2:
+            self._reject_orders(orders, "ARBITRAGE_PAIR_REQUIRED", ready)
+            return
+        for index in range(0, len(orders), 2):
+            raw_pair = orders[index : index + 2]
+            try:
+                first, second = [self._validate_order(raw, ready) for raw in raw_pair]
+                if (
+                    first["exchange"] == second["exchange"]
+                    or first["side"] == second["side"]
+                    or first["qty"] != second["qty"]
+                ):
+                    raise ValueError("INVALID_ARBITRAGE_PAIR")
+                self._require_marketable(first, ready, full_depth=True)
+                self._require_marketable(second, ready, full_depth=True)
+                # Both legs pass validation before either reserves funds or uses turnover.
+                self._accept_order(first, ready)
+                self._accept_order(second, ready)
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                self._reject_orders(raw_pair, str(exc), ready)
+
+    def submit(self, raw: Any, ready: int) -> None:
+        if self.config.require_paired_orders:
+            self.submit_orders([raw], ready)
+            return
+        self._count_orders(1)
         order = dict(raw) if isinstance(raw, dict) else {}
         try:
-            order = OrderRequest.model_validate(order).model_dump()
-            if order["id"] in self.ids:
-                raise ValueError("INVALID_OR_DUPLICATE_ID")
-            self.ids.add(order["id"])
-            if order.get("exchange") not in self.books or order.get("symbol") != self.config.symbol:
-                raise ValueError("UNKNOWN_INSTRUMENT")
-            venue = self.config.venues[order["exchange"]]
-            qty, price = order["qty"], order["price"]
-            if qty <= 0 or price <= 0 or qty % venue.lot_size or price % venue.tick_size:
-                raise ValueError("INVALID_TICK_OR_LOT")
-            notional = price * qty
-            if not venue.min_notional <= notional <= self.config.max_order_notional:
-                raise ValueError("ORDER_NOTIONAL_LIMIT")
-            window = self.turnover[order["exchange"]]
-            while window and window[0][0] <= ready - self.config.turnover_window_ns:
-                window.popleft()
-            if sum((n for _, n in window), ZERO) + notional > self.config.max_window_turnover:
-                raise ValueError("WINDOW_NOTIONAL_LIMIT")
-            wallet = self.accounts[order["exchange"]]
-            reserve = notional * (1 + venue.taker_fee_bps / BPS) if order["side"] == "Buy" else qty
-            asset = "quote" if order["side"] == "Buy" else "base"
-            if wallet[asset] - wallet["reserved_" + asset] < reserve:
-                raise ValueError("INSUFFICIENT_BALANCE")
-            wallet["reserved_" + asset] += reserve
-            window.append((ready, notional))
-            order.update(qty=qty, price=price, _reserve=reserve, _asset=asset)
-            self.push(ready + venue.order_latency_ns, 1, "arrival", order)
-            self.log(
-                "accepted",
-                order={k: v for k, v in order.items() if not k.startswith("_")},
-                arrival_ns=ready + venue.order_latency_ns,
-            )
+            order = self._validate_order(order, ready)
+            self._accept_order(order, ready)
         except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
             self.report(order, "Rejected", str(exc), t=ready)
+
+    def _track_unhedged_exposure(self) -> None:
+        if not self.config.require_paired_orders:
+            return
+        if self.exposure() == ZERO:
+            self.hedge_deadline = None
+        elif self.hedge_deadline is None:
+            self.hedge_deadline = self.now + self.config.max_unhedged_duration_ns
+            self.push(self.hedge_deadline, 4, "hedge_deadline", self.hedge_deadline)
 
     def execute(self, order: Dict[str, Any]) -> None:
         name = order["exchange"]
         wallet, book, venue = self.accounts[name], self.books[name], self.config.venues[name]
         wallet["reserved_" + order["_asset"]] -= order["_reserve"]
         if self.end is not None and self.now > self.end:
-            self.report(order, "Rejected", "END_OF_DATA")
+            self.report(order, "Rejected", "END_OF_DATA", settle_pending=True)
             return
         if not book.fresh(self.now, self.config.max_book_age_ns):
-            self.report(order, "Rejected", "STALE_OR_INVALID_BOOK")
+            self.report(order, "Rejected", "STALE_OR_INVALID_BOOK", settle_pending=True)
             return
         buy = order["side"] == "Buy"
         side = "asks" if buy else "bids"
@@ -332,6 +452,8 @@ class Judge:
             exposure_limit = self.config.max_net_exposure / self.exposure_price()
             exposure = self.exposure()
             risk_qty = max(ZERO, exposure_limit - exposure if buy else exposure_limit + exposure)
+            if order.get("_hedge"):
+                risk_qty = min(risk_qty, max(ZERO, -exposure if buy else exposure))
             available = book.remaining[side][price]
             # A sell limit is a minimum: validate budgets at actual fill prices too.
             order_budget = max(ZERO, self.config.max_order_notional - notional)
@@ -374,8 +496,17 @@ class Judge:
         if filled:
             self.fill_count += 1
             window.append((self.now, notional))
+            self._track_unhedged_exposure()
         status = "Filled" if filled == order["qty"] else "PartiallyFilled" if filled else "Canceled"
-        self.report(order, status, "" if status == "Filled" else reason, filled, notional, fee)
+        self.report(
+            order,
+            status,
+            "" if status == "Filled" else reason,
+            filled,
+            notional,
+            fee,
+            settle_pending=True,
+        )
         self.mark()
 
     def score(self) -> Dict[str, Any]:
@@ -384,6 +515,8 @@ class Judge:
         Zero-trade benchmark scores zero. Refuse a score when the available data
         cannot price the terminal hedge, rather than granting a free residual.
         """
+        if self.config.require_paired_orders and self.exposure() != ZERO:
+            raise ValueError("cannot score: unhedged exposure at end of episode")
         pnl = closing_fees = ZERO
         terminal = []
         for name, venue in self.config.venues.items():

@@ -226,9 +226,260 @@ class ExecutionTests(unittest.TestCase):
         times = [m["now_ns"] for m in script.messages]
         self.assertTrue(all(b - a >= 10 * MS for a, b in zip(times, times[1:])))
 
+    def test_real_profile_has_25ms_feed_to_report_latency_budget(self):
+        rules = Config.load(ROOT / "examples/real-test-config.json")
+        for venue in rules.venues.values():
+            self.assertEqual(
+                venue.extra_feed_latency_ns
+                + rules.compute_latency_ns
+                + venue.order_latency_ns
+                + venue.report_latency_ns,
+                25 * MS,
+            )
+
+        def callback(message):
+            if message["type"] == "market" and message["event"]["market_ts_ns"] == T + 10 * MS:
+                return [order("buy"), order("sell", "bybit", "Sell", "1", "99.99")]
+            return []
+
+        script = Script(callback=callback)
+        _, reports, _ = run(script, [book(10)], rules=rules)
+        self.assertEqual(len(reports), 2)
+        self.assertTrue(all(report["filled_qty"] == 1 for report in reports))
+        self.assertTrue(all(report["execution_ts_ns"] == T + 28 * MS for report in reports))
+        delivered = [message for message in script.messages if message["type"] == "execution"]
+        self.assertEqual(delivered[0]["now_ns"], T + 35 * MS)
+        self.assertEqual(delivered[1]["now_ns"], T + 37 * MS)
+
     def test_unpriced_terminal_inventory_cannot_receive_score(self):
         with self.assertRaisesRegex(ValueError, "terminal hedge depth"):
             run(Script([order()]), final=[book(100, qty="0.1"), book(100, "bybit")])
+
+
+class PairedOrderTests(unittest.TestCase):
+    def pair(self, qty="1"):
+        return [order("buy", qty=qty), order("sell", "bybit", "Sell", qty, "99.99")]
+
+    def strategy(self, orders, hedge=None):
+        sent = False
+
+        def callback(message):
+            nonlocal sent
+            if not sent and message["type"] == "market" and message["event"]["exchange"] == "bybit":
+                sent = True
+                return orders
+            if message["type"] == "execution" and hedge is not None:
+                return hedge(message)
+            return []
+
+        return Script(callback=callback)
+
+    def test_default_config_preserves_legacy_admission(self):
+        self.assertFalse(config().require_paired_orders)
+
+    def test_published_strict_config_exposes_rules_to_strategy(self):
+        rules = Config.load(ROOT / "examples/real-test-config.json")
+        self.assertTrue(rules.public()["require_paired_orders"])
+        self.assertEqual(rules.public()["max_unhedged_duration_ns"], 2_000_000_000)
+
+    def test_strict_config_requires_capacity_for_a_pair_and_hedgeable_lots(self):
+        with self.assertRaisesRegex(ValueError, "at least two orders"):
+            config(require_paired_orders=True, max_orders_per_callback=1)
+        row = config().raw
+        row["require_paired_orders"] = True
+        row["venues"]["binance"]["lot_size"] = "0.03"
+        row["venues"]["bybit"]["lot_size"] = "0.02"
+        with self.assertRaisesRegex(ValueError, "commensurate venue lots"):
+            Config.parse(row)
+        row["venues"]["binance"]["lot_size"] = "0.01"
+        self.assertTrue(Config.parse(row).require_paired_orders)
+
+    def test_single_venue_directional_entry_is_rejected(self):
+        result, reports, judge = run(
+            self.strategy([order()]), rules=config(require_paired_orders=True)
+        )
+        self.assertEqual(result["net_pnl"], 0)
+        self.assertEqual(reports[0]["reason"], "ARBITRAGE_PAIR_REQUIRED")
+        self.assertFalse(judge.pending_orders)
+
+    def test_direct_submit_obeys_pair_policy(self):
+        logs = []
+        judge = Judge(config(require_paired_orders=True), Script(), logs.append)
+        judge.submit(order(), T)
+        self.assertEqual(logs[0]["report"]["reason"], "ARBITRAGE_PAIR_REQUIRED")
+        self.assertEqual(judge.accounts["binance"]["reserved_quote"], 0)
+
+    def test_valid_pair_fills_both_venues(self):
+        result, reports, judge = run(
+            self.strategy(self.pair()), rules=config(require_paired_orders=True)
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(judge.exposure(), 0)
+        self.assertFalse(judge.pending_orders)
+        self.assertTrue(all(r["filled_qty"] == 1 for r in reports))
+        self.assertTrue(all("_settle_pending" not in m for m in judge.strategy.messages))
+
+    def test_mismatched_or_same_venue_pairs_are_rejected(self):
+        changes = [{"qty": "0.5"}, {"side": "Buy"}, {"exchange": "binance"}]
+        for change in changes:
+            with self.subTest(change=change):
+                pair = self.pair()
+                pair[1].update(change)
+                _, reports, judge = run(
+                    self.strategy(pair), rules=config(require_paired_orders=True)
+                )
+                self.assertTrue(all(r["reason"] == "INVALID_ARBITRAGE_PAIR" for r in reports))
+                self.assertEqual(judge.accounts["binance"]["reserved_quote"], 0)
+                self.assertFalse(judge.turnover["binance"])
+
+    def test_second_leg_validation_failure_does_not_admit_first(self):
+        pair = self.pair()
+        pair[1]["qty"] = "0.001"
+        _, reports, judge = run(self.strategy(pair), rules=config(require_paired_orders=True))
+        self.assertTrue(all(r["reason"] == "INVALID_TICK_OR_LOT" for r in reports))
+        self.assertEqual(judge.accounts["binance"]["reserved_quote"], 0)
+        self.assertFalse(judge.turnover["binance"])
+
+    def test_fake_unmarketable_second_leg_is_rejected(self):
+        pair = self.pair()
+        pair[1]["price"] = "110"
+        result, reports, _ = run(self.strategy(pair), rules=config(require_paired_orders=True))
+        self.assertEqual(result["filled_orders"], 0)
+        self.assertTrue(all(r["reason"] == "NON_MARKETABLE_LIMIT" for r in reports))
+
+    def test_known_insufficient_second_leg_depth_is_rejected(self):
+        script = Script(
+            callback=lambda message: (
+                self.pair()
+                if message["type"] == "market"
+                and message["event"]["exchange"] == "bybit"
+                and message["event"]["update_id"] == 2
+                else []
+            )
+        )
+        _, reports, _ = run(
+            script,
+            middle=[book(1, "bybit", qty="10")],
+            rules=config(require_paired_orders=True),
+        )
+        self.assertTrue(all(r["reason"] == "INSUFFICIENT_OBSERVED_DEPTH" for r in reports))
+
+    def test_pair_checks_use_callback_visible_books(self):
+        rules = config(require_paired_orders=True)
+        row = rules.raw
+        for venue in row["venues"].values():
+            venue["extra_feed_latency_ns"] = 50 * MS
+        pair = [order("buy", price="96"), order("sell", "bybit", "Sell", price="104")]
+        _, reports, _ = run(
+            self.strategy(pair),
+            middle=[book(30, bid="94", ask="95"), book(30, "bybit", bid="105", ask="106")],
+            rules=Config.parse(row),
+            final=[book(200), book(200, "bybit")],
+        )
+        self.assertTrue(all(r["reason"] == "NON_MARKETABLE_LIMIT" for r in reports[:2]))
+
+    def test_failed_leg_can_be_hedged_without_reversing_exposure(self):
+        def hedge(message):
+            if message["id"] == "sell":
+                # Over-sized requests can meet min_notional, but fills must stop at the residual.
+                return [order("hedge", side="Sell", qty="5", price="99.99")]
+            return []
+
+        result, reports, judge = run(
+            self.strategy(self.pair(), hedge),
+            middle=[book(5, "bybit", bid="98", ask="99")],
+            rules=config(require_paired_orders=True),
+        )
+        hedged = next(r for r in reports if r["id"] == "hedge")
+        self.assertEqual(hedged["filled_qty"], 1)
+        self.assertEqual(hedged["status"], "PartiallyFilled")
+        self.assertEqual(judge.exposure(), 0)
+        self.assertEqual(result["filled_orders"], 2)
+
+    def test_dust_residual_can_be_hedged_with_minimum_notional_request(self):
+        def hedge(message):
+            if message["id"] == "sell":
+                return [order("dust", side="Sell", qty="0.06", price="99.99")]
+            return []
+
+        # Both legs were executable when submitted; depth changes before arrival.
+        _, reports, judge = run(
+            self.strategy(self.pair(), hedge),
+            middle=[book(5, "bybit", qty="19.6")],
+            rules=config(require_paired_orders=True),
+        )
+        self.assertEqual(
+            next(r for r in reports if r["id"] == "dust")["filled_qty"], Decimal("0.02")
+        )
+        self.assertEqual(judge.exposure(), 0)
+
+    def test_residual_must_be_hedged_by_deadline(self):
+        with self.assertRaisesRegex(ValueError, "UNHEDGED_EXPOSURE_TIMEOUT"):
+            run(
+                self.strategy(self.pair()),
+                middle=[book(5, "bybit", bid="98", ask="99")],
+                rules=config(require_paired_orders=True, max_unhedged_duration_ns=20 * MS),
+            )
+
+    def test_partial_hedges_do_not_restart_the_deadline(self):
+        counter = 0
+
+        def hedge(message):
+            nonlocal counter
+            if message["id"] == "buy":
+                return []
+            counter += 1
+            return [order("hedge-" + str(counter), side="Sell", qty="0.06", price="99.99")]
+
+        judge = Judge(
+            config(require_paired_orders=True, max_unhedged_duration_ns=20 * MS),
+            self.strategy(self.pair(), hedge),
+        )
+        with self.assertRaisesRegex(ValueError, "UNHEDGED_EXPOSURE_TIMEOUT"):
+            judge.run(
+                [
+                    book(0),
+                    book(0, "bybit"),
+                    book(5, "bybit", bid="98", ask="99"),
+                    book(100),
+                    book(100, "bybit"),
+                ]
+            )
+        self.assertEqual(judge.now, T + 28 * MS)
+        self.assertEqual(judge.exposure(), Decimal("0.94"))
+
+    def test_terminal_restore_cannot_hide_an_unhedged_position(self):
+        with self.assertRaisesRegex(ValueError, "unhedged exposure at end"):
+            run(
+                self.strategy(self.pair()),
+                middle=[book(5, "bybit", bid="98", ask="99")],
+                rules=config(require_paired_orders=True),
+            )
+
+    def test_rejected_duplicate_report_cannot_release_a_pending_leg(self):
+        def hedge(message):
+            if message["id"] == "buy":
+                return [dict(order("sell", exchange="unknown"), _settle_pending=True)]
+            if message["id"] == "sell" and message["status"] == "Rejected":
+                return [order("probe")]
+            return []
+
+        result, reports, _ = run(
+            self.strategy(self.pair(), hedge), rules=config(require_paired_orders=True)
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertIn("AWAITING_EXECUTION_REPORTS", [r["reason"] for r in reports])
+        self.assertNotIn("ARBITRAGE_PAIR_REQUIRED", [r["reason"] for r in reports])
+
+    def test_multiple_pairs_share_reservations_and_turnover_limits(self):
+        pair = self.pair()
+        second = [order("buy2"), order("sell2", "bybit", "Sell", price="99.99")]
+        result, reports, _ = run(
+            self.strategy(pair + second),
+            rules=config(require_paired_orders=True, max_window_turnover="150"),
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(sum(r["reason"] == "WINDOW_NOTIONAL_LIMIT" for r in reports), 2)
 
 
 class BookAndDataTests(unittest.TestCase):
@@ -327,6 +578,47 @@ class BookAndDataTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_strict_demo_baseline_preserves_score(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            make_demo(root / "demo")
+            rules = json.loads((root / "demo/config.json").read_text())
+            rules["require_paired_orders"] = True
+            (root / "strict.json").write_text(dumps(rules))
+            result = evaluate(
+                root / "strict.json",
+                root / "demo/events.jsonl",
+                root / "demo/baseline",
+                root / "run",
+                "subprocess",
+            )
+            self.assertEqual(result["net_pnl"], Decimal("2.528435"))
+            self.assertEqual(result["filled_orders"], 26)
+
+    def test_strict_unhedged_failure_leaves_no_score(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rules = config(require_paired_orders=True, max_unhedged_duration_ns=20 * MS)
+            (root / "config.json").write_text(dumps(rules.raw))
+            stream = [
+                book(0),
+                book(0, "bybit", bid="100.8", ask="100.81"),
+                book(5, "bybit", bid="98", ask="99"),
+                book(100),
+                book(100, "bybit"),
+            ]
+            (root / "events.jsonl").write_text("".join(dumps(e) + "\n" for e in stream))
+            with self.assertRaisesRegex(ValueError, "UNHEDGED_EXPOSURE_TIMEOUT"):
+                evaluate(
+                    root / "config.json",
+                    root / "events.jsonl",
+                    ROOT / "examples/baseline",
+                    root / "run",
+                    "subprocess",
+                )
+            self.assertFalse((root / "run/scores.json").exists())
+            self.assertEqual(json.loads((root / "run/run.json").read_text())["status"], "failed")
+
     def test_demo_baseline_hold_and_repeat_are_reproducible(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
