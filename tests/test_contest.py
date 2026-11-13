@@ -10,7 +10,7 @@ from pathlib import Path
 from spot_contest.cli import evaluate, make_demo
 from spot_contest.data import events, normalize, prepare
 from spot_contest.engine import Book, Judge
-from spot_contest.models import Config, decimal, dumps
+from spot_contest.models import Config, decimal, dumps, fingerprint
 from spot_contest.service import extract_submission
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -282,6 +282,7 @@ class ExecutionTests(unittest.TestCase):
             for m in execution
         )
         diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["config_sha256"], fingerprint(rules.raw))
         self.assertEqual(diagnostics["max_callback_queue_delay_ns"]["execution"], expected)
         self.assertEqual(diagnostics["callback_counts"]["execution"], len(execution))
         self.assertEqual(sum(diagnostics["execution_status_counts"].values()), len(reports))

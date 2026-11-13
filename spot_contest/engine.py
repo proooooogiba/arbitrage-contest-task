@@ -5,7 +5,7 @@ from collections import Counter, deque
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from .models import BPS, ZERO, Config, OrderRequest, decimal
+from .models import BPS, ZERO, Config, OrderRequest, decimal, fingerprint
 
 
 def floor_lot(qty: Decimal, lot: Decimal) -> Decimal:
@@ -279,6 +279,7 @@ class Judge:
             time_models=sorted(self.sources),
             end_ns=self.end,
             diagnostics={
+                "config_sha256": fingerprint(self.config.raw),
                 "callback_counts": dict(self.callback_counts),
                 "max_callback_queue_delay_ns": dict(self.callback_queue_delay_ns),
                 "execution_status_counts": dict(self.execution_status_counts),
