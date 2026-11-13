@@ -7,7 +7,7 @@
 
 ```text
 начало callback = max(receive_ts_ns + extra_feed_latency_ns, освобождение стратегии)
-приход заявки = начало callback + compute_latency_ns + order_latency_ns[биржа]
+приход заявки = начало callback + стоимость callback + order_latency_ns[биржа]
 доставка отчёта = момент исполнения + report_latency_ns[биржа]
 ```
 
@@ -28,6 +28,18 @@
 
 После последнего события рынка новые callbacks прекращаются, заявки отклоняются
 с причиной `END_OF_DATA`.
+
+Для trade-callback стоимость задаёт `trade_compute_latency_ns`. При отсутствии
+поля или значении `null` используется `compute_latency_ns`. Значение `100000`
+означает 0,1 мс на trade. Значение `0` задаёт мгновенную обработку trade
+в виртуальном времени. Остальные callbacks используют `compute_latency_ns`.
+Публичный SDK и серверный Judge должны использовать одинаковые настройки.
+
+Поле `diagnostics` в `result.json` и ответе Judge API содержит число callbacks
+каждого типа, максимальное ожидание callback после доступности события или
+отчёта, число исполнений по статусам и число отклонений по причинам.
+Эти агрегаты доступны в `judge_result.json` из prediction step CodaBench.
+Поле `diagnostics.config_sha256` содержит хеш фактически применённого конфига.
 
 ## Балансы и ликвидность
 

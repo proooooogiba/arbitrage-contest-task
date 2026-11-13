@@ -102,13 +102,21 @@ def create_app(
                 evaluate(config, dataset, root, artifacts / job_id, "docker", image, runtime)
             import json
 
-            return json.loads((artifacts / job_id / "scores.json").read_text())
+            response = {
+                "job_id": job_id,
+                "scores": json.loads((artifacts / job_id / "scores.json").read_text()),
+            }
+            result_path = artifacts / job_id / "result.json"
+            if result_path.is_file():
+                diagnostics = json.loads(result_path.read_text()).get("diagnostics")
+                if diagnostics is not None:
+                    response["diagnostics"] = diagnostics
+            return response
 
         # CPU slots are serialized; the ASGI event loop remains responsive.
         async with gate:
             try:
-                scores = await run_in_threadpool(run_job)
-                return {"job_id": job_id, "scores": scores}
+                return await run_in_threadpool(run_job)
             except Exception:
                 return JSONResponse(
                     status_code=422,
