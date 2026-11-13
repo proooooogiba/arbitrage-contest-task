@@ -81,6 +81,7 @@ class Strategy:
 | `taker_fee_bps` | 10 bps = 0,1%, списание в USDT с каждого исполнения |
 | `order_latency_ns`, `report_latency_ns` | Binance: 5/3 мс, Bybit: 8/4 мс |
 | `extra_feed_latency_ns`, `compute_latency_ns` | Дополнительный feed: 0; вычисление: 1 мс |
+| `trade_compute_latency_ns` | Отдельная стоимость trade-callback в наносекундах. `null` использует `compute_latency_ns`, допускается `0` |
 | `depth_fraction`, `max_order_notional` | 5% глубины на уровень; до 1000 USDT на заявку |
 | `turnover_window_ns`, `max_window_turnover` | До 5000 USDT на биржу за скользящую секунду |
 | `max_net_exposure` | 2000 USDT при исполнении |

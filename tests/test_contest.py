@@ -58,6 +58,22 @@ def order(id="one", exchange="binance", side="Buy", qty="1", price="100"):
     }
 
 
+def trade(ms):
+    return normalize(
+        {
+            "event_type": "trade",
+            "exchange": "binance",
+            "symbol": "SOLUSDT",
+            "market_ts_ns": T + ms * MS,
+            "receive_ts_ns": T + ms * MS,
+            "price": "100",
+            "qty": "1",
+            "is_buyer_maker": False,
+        },
+        "events",
+    )
+
+
 class Script:
     def __init__(self, first=None, callback=None):
         self.first, self.callback = first or [], callback
@@ -225,6 +241,65 @@ class ExecutionTests(unittest.TestCase):
         run(script, [book(1), book(2)], rules=config(compute_latency_ns=10 * MS))
         times = [m["now_ns"] for m in script.messages]
         self.assertTrue(all(b - a >= 10 * MS for a, b in zip(times, times[1:])))
+
+    def test_trade_compute_latency_defaults_to_shared_cost(self):
+        script = Script()
+        run(script, [trade(1), trade(2)], rules=config(compute_latency_ns=10 * MS))
+        times = [
+            m["now_ns"]
+            for m in script.messages
+            if m["type"] == "market" and m["event"]["event_type"] == "trade"
+        ]
+        self.assertEqual(times[1] - times[0], 10 * MS)
+
+    def test_trade_compute_latency_can_be_zero_or_separate_cost(self):
+        for cost in (0, 3 * MS):
+            with self.subTest(cost=cost):
+                script = Script()
+                result, _, _ = run(
+                    script,
+                    [trade(1), trade(2)],
+                    rules=config(compute_latency_ns=10 * MS, trade_compute_latency_ns=cost),
+                )
+                times = [
+                    m["now_ns"]
+                    for m in script.messages
+                    if m["type"] == "market" and m["event"]["event_type"] == "trade"
+                ]
+                self.assertEqual(times[1] - times[0], cost)
+                self.assertEqual(result["diagnostics"]["callback_counts"]["trade"], 2)
+                self.assertEqual(
+                    config(trade_compute_latency_ns=cost).public()["trade_compute_latency_ns"], cost
+                )
+
+    def test_callback_diagnostics_match_observed_delivery_times(self):
+        rules = config(compute_latency_ns=10 * MS)
+        script = Script([order()])
+        result, reports, _ = run(script, [trade(1), trade(2)], rules=rules)
+        execution = [m for m in script.messages if m["type"] == "execution"]
+        expected = max(
+            m["now_ns"] - m["execution_ts_ns"] - rules.venues[m["exchange"]].report_latency_ns
+            for m in execution
+        )
+        diagnostics = result["diagnostics"]
+        self.assertEqual(diagnostics["max_callback_queue_delay_ns"]["execution"], expected)
+        self.assertEqual(diagnostics["callback_counts"]["execution"], len(execution))
+        self.assertEqual(sum(diagnostics["execution_status_counts"].values()), len(reports))
+
+    def test_order_from_trade_uses_separate_compute_cost(self):
+        script = Script(
+            callback=lambda message: (
+                [order("trade-order")]
+                if message["type"] == "market" and message["event"]["event_type"] == "trade"
+                else []
+            )
+        )
+        _, reports, _ = run(
+            script,
+            [trade(40)],
+            rules=config(compute_latency_ns=10 * MS, trade_compute_latency_ns=3 * MS),
+        )
+        self.assertEqual(reports[0]["execution_ts_ns"], T + 48 * MS)
 
     def test_real_profile_has_25ms_feed_to_report_latency_budget(self):
         rules = Config.load(ROOT / "examples/real-test-config.json")
@@ -420,6 +495,36 @@ class PairedOrderTests(unittest.TestCase):
                 middle=[book(5, "bybit", bid="98", ask="99")],
                 rules=config(require_paired_orders=True, max_unhedged_duration_ns=20 * MS),
             )
+
+    def test_trade_burst_cannot_starve_hedge_with_separate_trade_cost(self):
+        middle = [book(32, "bybit", bid="98", ask="99")] + [trade(32) for _ in range(210)]
+        final = [book(3000), book(3000, "bybit")]
+
+        def hedge(message):
+            return [order("hedge", side="Sell", price="99.99")] if message["id"] == "sell" else []
+
+        with self.assertRaisesRegex(ValueError, "UNHEDGED_EXPOSURE_TIMEOUT"):
+            run(
+                self.strategy(self.pair(), hedge),
+                middle=middle,
+                final=final,
+                rules=config(require_paired_orders=True, compute_latency_ns=10 * MS),
+            )
+        result, _, judge = run(
+            self.strategy(self.pair(), hedge),
+            middle=middle,
+            final=final,
+            rules=config(
+                require_paired_orders=True,
+                compute_latency_ns=10 * MS,
+                trade_compute_latency_ns=100_000,
+            ),
+        )
+        self.assertEqual(judge.exposure(), 0)
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertLess(
+            result["diagnostics"]["max_callback_queue_delay_ns"]["execution"], 2_000_000_000
+        )
 
     def test_partial_hedges_do_not_restart_the_deadline(self):
         counter = 0

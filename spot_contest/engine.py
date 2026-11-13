@@ -1,7 +1,7 @@
 """Trusted deterministic judge. Never import participant code in this process."""
 
 import heapq
-from collections import deque
+from collections import Counter, deque
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -134,6 +134,10 @@ class Judge:
         self.max_drawdown = ZERO
         self.sources = set()
         self.callbacks = 0
+        self.callback_counts = Counter()
+        self.callback_queue_delay_ns = Counter()
+        self.execution_status_counts = Counter()
+        self.rejection_reason_counts = Counter()
 
     def push(self, t: int, priority: int, kind: str, payload: Any) -> None:
         self.counter += 1
@@ -233,6 +237,32 @@ class Judge:
                     now_ns=self.now,
                     portfolio={k: dict(v) for k, v in self.observed.items()},
                 )
+                callback_latency = self.config.compute_latency_ns
+                if payload["type"] == "market":
+                    event = payload["event"]
+                    callback_kind = event["event_type"]
+                    available = (
+                        event["receive_ts_ns"]
+                        + self.config.venues[event["exchange"]].extra_feed_latency_ns
+                    )
+                    if (
+                        callback_kind == "trade"
+                        and self.config.trade_compute_latency_ns is not None
+                    ):
+                        callback_latency = self.config.trade_compute_latency_ns
+                elif payload["type"] == "execution":
+                    callback_kind = "execution"
+                    venue = self.config.venues.get(payload["exchange"])
+                    available = payload["execution_ts_ns"] + (
+                        venue.report_latency_ns if venue else 0
+                    )
+                else:
+                    callback_kind = "start"
+                    available = self.now
+                self.callback_counts[callback_kind] += 1
+                self.callback_queue_delay_ns[callback_kind] = max(
+                    self.callback_queue_delay_ns[callback_kind], self.now - available
+                )
                 orders = self.strategy.request(request)
                 self.callbacks += 1
                 if (
@@ -240,7 +270,7 @@ class Judge:
                     or len(orders) > self.config.max_orders_per_callback
                 ):
                     raise ValueError("strategy must return a bounded orders list")
-                self.busy_until = self.now + self.config.compute_latency_ns
+                self.busy_until = self.now + callback_latency
                 self.submit_orders(orders, self.busy_until)
         result = self.score()
         result.update(
@@ -248,6 +278,12 @@ class Judge:
             callbacks=self.callbacks,
             time_models=sorted(self.sources),
             end_ns=self.end,
+            diagnostics={
+                "callback_counts": dict(self.callback_counts),
+                "max_callback_queue_delay_ns": dict(self.callback_queue_delay_ns),
+                "execution_status_counts": dict(self.execution_status_counts),
+                "rejection_reason_counts": dict(self.rejection_reason_counts),
+            },
         )
         self.log("summary", result=result)
         return result
@@ -285,10 +321,12 @@ class Judge:
         if self.config.require_paired_orders and settle_pending:
             report["_settle_pending"] = True
         self.log("execution", report=dict(report))
+        self.execution_status_counts[status] += 1
         latency = self.config.venues[exchange].report_latency_ns if exchange in self.books else 0
         self.push((self.now if t is None else t) + latency, 2, "deliver", report)
         if status == "Rejected":
             self.rejected += 1
+            self.rejection_reason_counts[reason] += 1
 
     def _count_orders(self, count: int) -> None:
         self.order_count += count

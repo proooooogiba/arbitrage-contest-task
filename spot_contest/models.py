@@ -4,7 +4,7 @@ import hashlib
 import json
 from decimal import Decimal, DefaultContext, InvalidOperation, getcontext
 from pathlib import Path
-from typing import Annotated, Any, Dict, Literal
+from typing import Annotated, Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -77,6 +77,7 @@ class Config(Contract):
     reference_price: PositiveMoney
     venues: Annotated[Dict[Name, Venue], Field(min_length=2, max_length=2)]
     compute_latency_ns: PositiveInteger = 1_000_000
+    trade_compute_latency_ns: Optional[Nanoseconds] = None
     max_book_age_ns: PositiveInteger = 500_000_000
     depth_fraction: Annotated[PositiveMoney, Field(le=1)] = Decimal("0.05")
     max_order_notional: PositiveMoney = Decimal("1000")
@@ -132,6 +133,7 @@ class Config(Contract):
             "base_asset": self.base_asset,
             "quote_asset": self.quote_asset,
             "compute_latency_ns": self.compute_latency_ns,
+            "trade_compute_latency_ns": self.trade_compute_latency_ns,
             "max_book_age_ns": self.max_book_age_ns,
             "depth_fraction": self.depth_fraction,
             "max_order_notional": self.max_order_notional,
