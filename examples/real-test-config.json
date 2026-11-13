@@ -28,6 +28,7 @@
     }
   },
   "compute_latency_ns": 2000000,
+  "trade_compute_latency_ns": 100000,
   "max_book_age_ns": 500000000,
   "depth_fraction": "0.05",
   "max_order_notional": "1000",

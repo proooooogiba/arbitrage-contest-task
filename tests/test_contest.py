@@ -304,6 +304,7 @@ class ExecutionTests(unittest.TestCase):
 
     def test_real_profile_has_25ms_feed_to_report_latency_budget(self):
         rules = Config.load(ROOT / "examples/real-test-config.json")
+        self.assertEqual(rules.trade_compute_latency_ns, 100_000)
         for venue in rules.venues.values():
             self.assertEqual(
                 venue.extra_feed_latency_ns
