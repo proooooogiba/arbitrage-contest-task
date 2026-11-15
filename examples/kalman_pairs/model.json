@@ -1,0 +1,23 @@
+{
+  "mean": -0.0008648618288026158,
+  "exit_cost": 0.252199999999998,
+  "training_samples": 89020,
+  "training_pairs": 52785,
+  "training_cutoff_ns": 1790812800100000000,
+  "winsor_limits": [
+    -0.040000000000020464,
+    0.04000000000000625
+  ],
+  "rho": 0.898920030456022,
+  "stationary_variance": 0.0001455875264586313,
+  "observation_variance": 2.2437235255596486e-05,
+  "public_cache_sha256": {
+    "binance": "cb9a6d6a90fd8c591bc08a76cf6f8d73919d90379aa4e7dc04934066b05e8a03",
+    "bybit": "c02142ab0fe21ef791f5974f147340ca0780f42a54af5707160a2deb9d4f9e9d"
+  },
+  "forecast_validation": {
+    "horizon_seconds": 60,
+    "samples": 54241,
+    "rmse_usdt_per_sol": 0.012521808669434949
+  }
+}
