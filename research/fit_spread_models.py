@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-def prepare_cache(data, cache):
+def prepare_cache(data, cache, include_depth=False):
     import pyarrow.parquet as pq
 
     cache.mkdir(parents=True, exist_ok=True)
@@ -24,6 +24,8 @@ def prepare_cache(data, cache):
         "bid_prices",
         "ask_prices",
     ]
+    if include_depth:
+        columns.extend(["bid_quantities", "ask_quantities"])
     for venue in ("binance", "bybit"):
         chunks = []
         path = data / (venue + "_spot-market_frames.parquet")
@@ -41,7 +43,18 @@ def prepare_cache(data, cache):
                     for key in ("window_end_ns", "ts_publish_ns", "ts_recv_ns")
                 ]
             )
-            chunks.append(dict(t=available, good=good, bid=bid, ask=ask, age=age))
+            chunk = dict(t=available, good=good, bid=bid, ask=ask, age=age)
+            if include_depth:
+                bids = np.asarray(frame["bid_quantities"], dtype=float)
+                asks = np.asarray(frame["ask_quantities"], dtype=float)
+                bid_depth = bids[:, :5].sum(axis=1)
+                ask_depth = asks[:, :5].sum(axis=1)
+                chunk.update(
+                    bq=bids[:, 0],
+                    aq=asks[:, 0],
+                    imb5=(bid_depth - ask_depth) / (bid_depth + ask_depth + 1e-12),
+                )
+            chunks.append(chunk)
         combined = {key: np.concatenate([chunk[key] for chunk in chunks]) for key in chunks[0]}
         np.savez_compressed(cache / (venue + "-bbo.npz"), **combined)
 
