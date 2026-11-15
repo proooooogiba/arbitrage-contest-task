@@ -1,0 +1,12 @@
+{
+  "mode": "median_mad",
+  "signal_threshold": 1.5,
+  "max_qty": 0.1,
+  "warmup_seconds": 60,
+  "cooldown_seconds": 60,
+  "max_hold_seconds": 120,
+  "stop_loss": 0.05,
+  "minimum_hold_seconds": 5,
+  "max_entry_cost_bps": 25,
+  "max_entries": 12
+}

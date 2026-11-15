@@ -1,0 +1,14 @@
+{
+  "median_mad": {"signal_threshold": 1.5},
+  "quantile_band": {"signal_threshold": 0.8},
+  "ema_momentum": {"signal_threshold": 0.25},
+  "channel_breakout": {"signal_threshold": 0.2},
+  "rsi_reversal": {"signal_threshold": 0.4},
+  "lead_lag": {"signal_threshold": 0.5},
+  "queue_pressure": {"signal_threshold": 0.25},
+  "microprice": {"signal_threshold": 0.05},
+  "trade_flow": {"signal_threshold": 0.25},
+  "book_ofi": {"signal_threshold": 0.5},
+  "cusum_reversal": {"signal_threshold": 1.0},
+  "regime_adaptive": {"signal_threshold": 0.5}
+}
