@@ -1,0 +1,11 @@
+{
+  "max_qty": 1,
+  "warmup_seconds": 10,
+  "cooldown_seconds": 2,
+  "max_hold_seconds": 300,
+  "stop_loss": 1.008799999999992,
+  "profit_margin": 0.005,
+  "forecast_seconds": 60,
+  "confidence": 1,
+  "minimum_hold_seconds": 1
+}
