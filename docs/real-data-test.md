@@ -15,12 +15,12 @@
 Полный многодневный Train ещё не проверен полным запуском оценки.
 
 ```bash
-python -m spot_contest validate --config examples/real-test-config.json \
+.venv/bin/python -m spot_contest validate --config examples/real-test-config.json \
   --data data/train/quickstart/events.jsonl
-docker build -f Dockerfile.strategy -t spot-contest-strategy:real-test-20261109 .
-python -m spot_contest evaluate --config examples/real-test-config.json \
-  --data data/train/quickstart/events.jsonl --submission examples/baseline \
-  --output runs/real-baseline-001 --image spot-contest-strategy:real-test-20261109
+docker build -f Dockerfile.strategy -t spot-contest-strategy:0.1.0 .
+.venv/bin/python -m spot_contest evaluate --config examples/real-test-config.json \
+  --data data/train/quickstart/events.jsonl --submission examples/kalman_pairs \
+  --output runs/real-kalman-001
 ```
 
 На сервере решения оцениваются на отдельном закрытом часовом наборе данных.
@@ -57,21 +57,17 @@ python -m spot_contest evaluate --config examples/real-test-config.json \
 число callbacks, максимальная очередь каждого типа, статусы исполнений и причины
 отклонений. Хеш правил можно сопоставить с `config_sha256` локального `run.json`.
 
-В конце исходный запас SOL восстанавливается отдельно на каждой бирже по
-оставшейся глубине с taker-комиссией. Стратегия без сделок получает ноль.
-
-Включён обязательный парный вход. Отправляйте Buy и Sell одинакового объёма
-на разных биржах. Остаток от независимого исполнения ног нужно закрыть за
-2 секунды. [Правила парного входа](strategy-contract.md#обязательный-парный-вход).
+Правила парного входа и хеджирования описаны в
+[контракте стратегии](strategy-contract.md#обязательный-парный-вход),
+формула score — в [расчёте результата](architecture.md#итоговый-результат).
 
 ## Стратегии для проверки
 
-- `examples/hold` — стратегия без сделок с нулевым результатом.
-- `examples/baseline` — арбитраж с учётом комиссий.
-- `examples/cross_spread` — арбитраж положительного спреда без учёта комиссий в сигнале.
-- `examples/broken` — ошибка, приводящая к `Failed` без score.
+- [Kalman](../examples/kalman_pairs/README.md) — основной пример с готовой моделью,
+  обработкой частичных исполнений и хеджированием остатка.
+- [baseline](../examples/baseline/strategy.py) — простой арбитраж с фильтром комиссий
+  без полноценного аварийного хеджирования.
 
-Оба торговых примера не реализуют полноценное аварийное хеджирование.
 Нулевая или отрицательная доходность не считается технической ошибкой.
 
 Параметры реального теста отличаются от синтетического примера, поэтому их
