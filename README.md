@@ -1,4 +1,4 @@
-# Spot–Spot Arbitrage Contest
+# Arbitrage Contest
 
 Напишите Python-стратегию taker–taker арбитража между двумя spot-биржами.
 Покупайте актив на одной площадке и продавайте на другой с учётом комиссий,
