@@ -588,6 +588,100 @@ class PairedOrderTests(unittest.TestCase):
         self.assertEqual(result["filled_orders"], 2)
         self.assertEqual(sum(r["reason"] == "WINDOW_NOTIONAL_LIMIT" for r in reports), 2)
 
+    def test_multiple_pairs_cannot_reserve_the_same_depth(self):
+        second = [order("buy2"), order("sell2", "bybit", "Sell", price="99.99")]
+        logs = []
+        judge = Judge(
+            config(require_paired_orders=True), self.strategy(self.pair() + second), logs.append
+        )
+        result = judge.run(
+            [
+                book(0, qty="40"),
+                book(0, "bybit", qty="20"),
+                book(100, qty="40"),
+                book(100, "bybit", qty="20"),
+            ]
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(judge.exposure(), 0)
+        reasons = [r["report"]["reason"] for r in logs if r["type"] == "execution"]
+        self.assertEqual(reasons.count("INSUFFICIENT_OBSERVED_DEPTH"), 2)
+        self.assertFalse(judge.depth_reservations)
+
+    def test_reported_fills_and_identical_snapshots_do_not_refill_visible_depth(self):
+        def callback(message):
+            if message["type"] == "market" and message["event"]["exchange"] == "bybit":
+                suffix = str(message["event"]["update_id"])
+                return [order("b" + suffix), order("s" + suffix, "bybit", "Sell", price="99.99")]
+            return []
+
+        logs = []
+        judge = Judge(config(require_paired_orders=True), Script(callback=callback), logs.append)
+        result = judge.run(
+            [
+                book(0, qty="20"),
+                book(0, "bybit", qty="20"),
+                book(40, qty="20"),
+                book(40, "bybit", qty="20"),
+                book(100, qty="20"),
+                book(100, "bybit", qty="20"),
+            ]
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(
+            result["diagnostics"]["rejection_reason_counts"].get("INSUFFICIENT_OBSERVED_DEPTH"), 2
+        )
+
+    def test_failed_pair_does_not_reserve_depth_for_later_valid_pair(self):
+        first = [order("b1"), order("s1", "bybit", "Sell", price="110")]
+        result, _, _ = run(
+            self.strategy(first + self.pair()), rules=config(require_paired_orders=True)
+        )
+        self.assertEqual(result["filled_orders"], 2)
+
+    def test_positive_depth_increment_replenishes_consumed_visible_capacity(self):
+        def callback(message):
+            if message["type"] == "market" and message["event"]["exchange"] == "bybit":
+                suffix = str(message["event"]["update_id"])
+                return [order("b" + suffix), order("s" + suffix, "bybit", "Sell", price="99.99")]
+            return []
+
+        judge = Judge(config(require_paired_orders=True), Script(callback=callback))
+        result = judge.run(
+            [
+                book(0, qty="20"),
+                book(0, "bybit", qty="20"),
+                book(40, qty="40"),
+                book(40, "bybit", qty="40"),
+                book(100, qty="40"),
+                book(100, "bybit", qty="40"),
+            ]
+        )
+        self.assertEqual(result["filled_orders"], 4)
+
+    def test_report_before_new_price_or_epoch_book_does_not_lose_consumption(self):
+        for epoch in (1, 2):
+            with self.subTest(epoch=epoch):
+                judge = Judge(config(require_paired_orders=True), self.strategy(self.pair()))
+                judge.run(
+                    [
+                        book(0, qty="20"),
+                        book(0, "bybit", qty="20"),
+                        book(
+                            5,
+                            bid="98",
+                            ask="99",
+                            qty="20",
+                            stream_epoch=epoch,
+                            receive_ts_ns=T + 60 * MS,
+                        ),
+                        book(100, bid="98", ask="99", qty="20", stream_epoch=epoch),
+                        book(100, "bybit", qty="20"),
+                    ]
+                )
+                self.assertEqual(judge.visible_books["binance"].remaining["asks"][Decimal("99")], 0)
+                self.assertFalse(judge.visible_fill_debts["binance"])
+
 
 class BookAndDataTests(unittest.TestCase):
     def test_repeated_snapshots_do_not_refill_liquidity(self):
@@ -715,16 +809,40 @@ class IntegrationTests(unittest.TestCase):
                 book(100, "bybit"),
             ]
             (root / "events.jsonl").write_text("".join(dumps(e) + "\n" for e in stream))
+            broken = root / "unhedged"
+            broken.mkdir()
+            (broken / "strategy.py").write_text(
+                "class Strategy:\n"
+                " def on_start(self, config, portfolio): self.sent = False; return []\n"
+                " def on_market_event(self, event, portfolio):\n"
+                "  if self.sent or event['exchange'] != 'bybit': return []\n"
+                "  self.sent = True\n"
+                "  return "
+                + repr([order("b"), order("s", "bybit", "Sell", price="100.8")])
+                + "\n def on_execution_report(self, report, portfolio): return []\n"
+            )
             with self.assertRaisesRegex(ValueError, "UNHEDGED_EXPOSURE_TIMEOUT"):
                 evaluate(
                     root / "config.json",
                     root / "events.jsonl",
-                    ROOT / "examples/baseline",
+                    broken,
                     root / "run",
                     "subprocess",
                 )
             self.assertFalse((root / "run/scores.json").exists())
             self.assertEqual(json.loads((root / "run/run.json").read_text())["status"], "failed")
+            hedged = evaluate(
+                root / "config.json",
+                root / "events.jsonl",
+                ROOT / "examples/baseline",
+                root / "hedged",
+                "subprocess",
+            )
+            self.assertEqual(hedged["filled_orders"], 2)
+            self.assertEqual(
+                sum(w["base"] for w in hedged["ending_balances"].values()),
+                sum(v.initial_base for v in rules.venues.values()),
+            )
 
     def test_demo_baseline_hold_and_repeat_are_reproducible(self):
         with tempfile.TemporaryDirectory() as temp:

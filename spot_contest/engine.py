@@ -106,6 +106,9 @@ class Judge:
             else {}
         )
         self.pending_orders = set()
+        self.depth_reservations = {}
+        self.reported_fills = {}
+        self.visible_fill_debts = {name: [] for name in self.visible_books}
         self.hedge_deadline = None
         self.accounts = {
             name: {
@@ -225,6 +228,14 @@ class Judge:
                     continue
                 if payload.pop("_settle_pending", False):
                     self.pending_orders.discard(payload["id"])
+                    self.depth_reservations.pop(payload["id"], None)
+                    fills = self.reported_fills.pop(payload["id"], None)
+                    if fills is not None:
+                        name, epoch, side, levels, executed_at = fills
+                        self.visible_fill_debts[name].extend(
+                            (epoch, side, price, qty, executed_at) for price, qty in levels
+                        )
+                        self._apply_visible_fills(name)
                 if (
                     self.config.require_paired_orders
                     and payload["type"] == "market"
@@ -232,6 +243,7 @@ class Judge:
                 ):
                     event = payload["event"]
                     self.visible_books[event["exchange"]].apply(event)
+                    self._apply_visible_fills(event["exchange"])
                 request = dict(
                     payload,
                     now_ns=self.now,
@@ -367,6 +379,12 @@ class Judge:
         self.turnover[name].append((ready, order["price"] * order["qty"]))
         if self.config.require_paired_orders:
             self.pending_orders.add(order["id"])
+            self.depth_reservations[order["id"]] = (
+                name,
+                self.visible_books[name].epoch,
+                "asks" if order["side"] == "Buy" else "bids",
+                order.get("_depth_plan", {}),
+            )
         arrival = ready + self.config.venues[name].order_latency_ns
         self.push(arrival, 1, "arrival", order)
         self.log(
@@ -378,6 +396,23 @@ class Judge:
     def _reject_orders(self, orders: List[Any], reason: str, ready: int) -> None:
         for raw in orders:
             self.report(raw if isinstance(raw, dict) else {}, "Rejected", reason, t=ready)
+
+    def _apply_visible_fills(self, name: str) -> None:
+        """Charge only reported fills, retaining debt if its book has not arrived.
+
+        With independently delayed book/report streams, this admission estimate
+        can be conservative. Execution still uses the exchange-side book.
+        """
+        book = self.visible_books[name]
+        debts = []
+        for epoch, side, price, qty, executed_at in self.visible_fill_debts[name]:
+            if book.epoch == epoch and price in book.remaining[side]:
+                take = min(qty, book.remaining[side][price])
+                book.remaining[side][price] -= take
+                qty -= take
+            if qty and book.ts < executed_at:
+                debts.append((epoch, side, price, qty, executed_at))
+        self.visible_fill_debts[name] = debts
 
     def _require_marketable(self, order: Dict[str, Any], ready: int, full_depth: bool) -> None:
         book = self.visible_books[order["exchange"]]
@@ -391,13 +426,30 @@ class Judge:
             raise ValueError("NON_MARKETABLE_LIMIT")
         if full_depth:
             lot = self.config.venues[order["exchange"]].lot_size
-            available = ZERO
+            remaining = order["qty"]
+            plan = {}
             for price in prices:
                 if buy and price > order["price"] or not buy and price < order["price"]:
                     break
-                available += floor_lot(book.levels[side][price] * book.fraction, lot)
-            if available < order["qty"]:
+                reserved = sum(
+                    (
+                        levels.get(price, ZERO)
+                        for name, epoch, reserved_side, levels in self.depth_reservations.values()
+                        if name == order["exchange"]
+                        and epoch == book.epoch
+                        and reserved_side == side
+                    ),
+                    ZERO,
+                )
+                take = min(remaining, floor_lot(book.remaining[side][price] - reserved, lot))
+                if take:
+                    plan[price] = take
+                    remaining -= take
+                if not remaining:
+                    break
+            if remaining:
                 raise ValueError("INSUFFICIENT_OBSERVED_DEPTH")
+            order["_depth_plan"] = plan
 
     def submit_orders(self, orders: List[Any], ready: int) -> None:
         if not self.config.require_paired_orders:
@@ -480,6 +532,7 @@ class Judge:
         buy = order["side"] == "Buy"
         side = "asks" if buy else "bids"
         filled = notional = ZERO
+        fills = []
         reason = "NO_LIQUIDITY_WITHIN_LIMIT"
         window = self.executed_turnover[name]
         while window and window[0][0] <= self.now - self.config.turnover_window_ns:
@@ -522,6 +575,7 @@ class Judge:
             if wallet["base"] < 0 or wallet["quote"] < 0:
                 raise RuntimeError("accounting invariant: negative spot wallet")
             book.remaining[side][price] -= qty
+            fills.append((price, qty))
             filled += qty
             notional += cash
             self.peak_exposure = max(
@@ -537,6 +591,10 @@ class Judge:
             window.append((self.now, notional))
             self._track_unhedged_exposure()
         status = "Filled" if filled == order["qty"] else "PartiallyFilled" if filled else "Canceled"
+        if self.config.require_paired_orders:
+            # Applied only when the strategy processes this order's report. Do not
+            # expose the exchange's newer book or unreported fills at admission.
+            self.reported_fills[order["id"]] = (name, book.epoch, side, fills, self.now)
         self.report(
             order,
             status,
