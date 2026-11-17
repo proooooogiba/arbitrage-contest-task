@@ -19,15 +19,17 @@ class Strategy:
         # The baseline accepts snapshots; a custom strategy can reconstruct deltas.
         if not event["valid"]:
             self.books.pop(event["exchange"], None)
-            return []
+            return [] if self.pending else self.hedge(portfolio, event["now_ns"])
         if not event["is_snapshot"]:
             return []
         self.books[event["exchange"]] = event
-        if len(self.books) != 2 or self.pending:
+        if self.pending:
             return []
         residual = sum(Decimal(wallet["base"]) for wallet in portfolio.values()) - self.initial_base
         if residual:
             return self.hedge(portfolio, event["now_ns"])
+        if len(self.books) != 2:
+            return []
         if event["receive_ts_ns"] - self.last_trade_ns < 200_000_000:
             return []
         names = list(self.config["venues"])
