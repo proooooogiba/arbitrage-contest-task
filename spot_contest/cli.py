@@ -129,7 +129,9 @@ def make_demo(directory: Path):
         raise ValueError("demo assets require a source checkout / editable installation")
     shutil.copyfile(example / "config.json", directory / "config.json")
     shutil.copytree(example / "baseline", directory / "baseline")
-    shutil.copytree(example / "hold", directory / "hold")
+    hold = directory / "hold"
+    hold.mkdir()
+    shutil.copyfile(Path(__file__).parent / "fixtures/hold.py", hold / "strategy.py")
     dataset = directory / "market_frames.jsonl"
     # Explicitly synthetic schema-v4 frames, not purported exchange history.
     with dataset.open("w") as stream:
