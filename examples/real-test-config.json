@@ -43,5 +43,5 @@
   "max_message_bytes": 1048576,
   "sandbox_memory_mb": 1024,
   "sandbox_cpus": "1",
-  "max_run_seconds": 1800
+  "max_run_seconds": 600
 }
