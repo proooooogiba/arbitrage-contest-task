@@ -334,6 +334,84 @@ class ExecutionTests(unittest.TestCase):
 
 
 class PairedOrderTests(unittest.TestCase):
+    def test_known_actual_sell_notional_rejects_both_legs(self):
+        pair = [
+            order("b", qty="8.40", price="118.90"),
+            order("s", "bybit", "Sell", qty="8.40", price="118.90"),
+        ]
+        logs = []
+        judge = Judge(
+            Config.load(ROOT / "examples/real-test-config.json"), self.strategy(pair), logs.append
+        )
+        result = judge.run(
+            [
+                book(0, bid="118.89", ask="118.90"),
+                book(0, "bybit", bid="119.90", ask="119.91"),
+                book(100, bid="118.89", ask="118.90"),
+                book(100, "bybit", bid="119.90", ask="119.91"),
+            ]
+        )
+        self.assertEqual(result["filled_orders"], 0)
+        self.assertEqual(result["net_pnl"], 0)
+        self.assertEqual(
+            result["diagnostics"]["rejection_reason_counts"], {"OBSERVED_ORDER_NOTIONAL_LIMIT": 2}
+        )
+        self.assertFalse(judge.depth_reservations)
+
+    def test_pairs_reserve_visible_sell_turnover(self):
+        pair = [
+            order("b", price="50"),
+            order("s", "bybit", "Sell", price="50"),
+            order("b2", price="50"),
+            order("s2", "bybit", "Sell", price="50"),
+        ]
+        judge = Judge(
+            config(require_paired_orders=True, max_window_turnover="150"), self.strategy(pair)
+        )
+        result = judge.run(
+            [
+                book(0, bid="49.99", ask="50"),
+                book(0, "bybit"),
+                book(100, bid="49.99", ask="50"),
+                book(100, "bybit"),
+            ]
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(
+            result["diagnostics"]["rejection_reason_counts"], {"OBSERVED_WINDOW_NOTIONAL_LIMIT": 2}
+        )
+
+    def test_batch_cannot_knowingly_clip_first_legs_at_exposure_limit(self):
+        second = [order("b2"), order("s2", "bybit", "Sell", price="99.99")]
+        result, _, judge = run(
+            self.strategy(self.pair() + second),
+            rules=config(require_paired_orders=True, max_net_exposure="150"),
+        )
+        self.assertEqual(result["filled_orders"], 2)
+        self.assertEqual(judge.exposure(), 0)
+        self.assertEqual(
+            result["diagnostics"]["rejection_reason_counts"], {"OBSERVED_NET_EXPOSURE_LIMIT": 2}
+        )
+
+    def test_unseen_price_change_can_clip_but_reports_actual_reason(self):
+        def hedge(message):
+            return (
+                [order("h", side="Sell", qty="0.1", price="99.99")]
+                if message["id"] == "sell"
+                else []
+            )
+
+        result, reports, judge = run(
+            self.strategy(self.pair("10"), hedge),
+            middle=[book(5, "bybit", bid="101", ask="101.01")],
+            rules=config(require_paired_orders=True),
+        )
+        sell = next(r for r in reports if r["id"] == "sell")
+        self.assertEqual(sell["filled_qty"], Decimal("9.90"))
+        self.assertEqual(sell["reason"], "EXECUTED_NOTIONAL_LIMIT")
+        self.assertEqual(judge.exposure(), 0)
+        self.assertEqual(result["filled_orders"], 3)
+
     def pair(self, qty="1"):
         return [order("buy", qty=qty), order("sell", "bybit", "Sell", qty, "99.99")]
 

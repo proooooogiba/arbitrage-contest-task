@@ -131,6 +131,7 @@ class Judge:
         self.ids = set()
         self.turnover = {name: deque() for name in config.venues}
         self.executed_turnover = {name: deque() for name in config.venues}
+        self.visible_turnover = {name: deque() for name in config.venues}
         self.order_count = self.fill_count = self.rejected = 0
         self.fees = self.notional = self.peak_exposure = ZERO
         self.peak_equity = config.initial_equity
@@ -228,6 +229,10 @@ class Judge:
                     continue
                 if payload.pop("_settle_pending", False):
                     self.pending_orders.discard(payload["id"])
+                    if payload["notional"]:
+                        self.visible_turnover[payload["exchange"]].append(
+                            (payload["execution_ts_ns"], payload["notional"])
+                        )
                     self.depth_reservations.pop(payload["id"], None)
                     fills = self.reported_fills.pop(payload["id"], None)
                     if fills is not None:
@@ -376,7 +381,9 @@ class Judge:
     def _accept_order(self, order: Dict[str, Any], ready: int) -> None:
         name = order["exchange"]
         self.accounts[name]["reserved_" + order["_asset"]] += order["_reserve"]
-        self.turnover[name].append((ready, order["price"] * order["qty"]))
+        self.turnover[name].append(
+            (ready, max(order["price"] * order["qty"], order.get("_visible_notional", ZERO)))
+        )
         if self.config.require_paired_orders:
             self.pending_orders.add(order["id"])
             self.depth_reservations[order["id"]] = (
@@ -449,6 +456,29 @@ class Judge:
                     break
             if remaining:
                 raise ValueError("INSUFFICIENT_OBSERVED_DEPTH")
+            notional = sum((p * q for p, q in plan.items()), ZERO)
+            if notional > self.config.max_order_notional:
+                raise ValueError("OBSERVED_ORDER_NOTIONAL_LIMIT")
+            name = order["exchange"]
+            submitted = sum((n for _, n in self.turnover[name]), ZERO)
+            # Reports can arrive out of execution order; filter rather than popleft.
+            cutoff = ready - self.config.turnover_window_ns
+            self.visible_turnover[name] = deque(
+                (t, n) for t, n in self.visible_turnover[name] if t > cutoff
+            )
+            known = sum((n for _, n in self.visible_turnover[name]), ZERO)
+            reserved = sum(
+                (
+                    p * q
+                    for venue, _, _, levels in self.depth_reservations.values()
+                    if venue == name
+                    for p, q in levels.items()
+                ),
+                ZERO,
+            )
+            if max(submitted, known + reserved) + notional > self.config.max_window_turnover:
+                raise ValueError("OBSERVED_WINDOW_NOTIONAL_LIMIT")
+            order["_visible_notional"] = notional
             order["_depth_plan"] = plan
 
     def submit_orders(self, orders: List[Any], ready: int) -> None:
@@ -492,6 +522,30 @@ class Judge:
                     raise ValueError("INVALID_ARBITRAGE_PAIR")
                 self._require_marketable(first, ready, full_depth=True)
                 self._require_marketable(second, ready, full_depth=True)
+                arrivals = [
+                    (
+                        self.config.venues[name].order_latency_ns,
+                        sum(levels.values(), ZERO) * (1 if side == "asks" else -1),
+                    )
+                    for name, _, side, levels in self.depth_reservations.values()
+                ]
+                arrivals.extend(
+                    (
+                        self.config.venues[o["exchange"]].order_latency_ns,
+                        o["qty"] * (1 if o["side"] == "Buy" else -1),
+                    )
+                    for o in (first, second)
+                )
+                risk_price = max(
+                    [self.config.reference_price]
+                    + [max(b.levels["asks"]) for b in self.visible_books.values() if b.valid]
+                )
+                projected = ZERO
+                # Stable ordering matches arrival insertion order at equal latency.
+                for _, delta in sorted(arrivals, key=lambda item: item[0]):
+                    projected += delta
+                    if abs(projected) * risk_price > self.config.max_net_exposure:
+                        raise ValueError("OBSERVED_NET_EXPOSURE_LIMIT")
                 # Both legs pass validation before either reserves funds or uses turnover.
                 self._accept_order(first, ready)
                 self._accept_order(second, ready)
@@ -560,6 +614,13 @@ class Judge:
                 ),
                 venue.lot_size,
             )
+            desired = floor_lot(min(order["qty"] - filled, available), venue.lot_size)
+            if qty < desired:
+                budget_qty = floor_lot(min(order_budget, window_budget) / price, venue.lot_size)
+                if budget_qty <= qty:
+                    reason = "EXECUTED_NOTIONAL_LIMIT"
+                elif floor_lot(risk_qty, venue.lot_size) <= qty:
+                    reason = "NET_EXPOSURE_LIMIT"
             if not qty:
                 if risk_qty < venue.lot_size:
                     reason = "NET_EXPOSURE_LIMIT"
